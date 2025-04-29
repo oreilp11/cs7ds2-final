@@ -328,17 +328,16 @@ class Week6LossFunction():
 # Code obtained from Week 9 ML Assignment
 # -----------------------------------------------------------------------------#
 # hyperparameters
-batch_size = 64 # how many independent sequences will we process in parallel?
-block_size = 256 # what is the maximum context length for predictions?
-max_iters = 1000
-eval_interval = 500
-eval_iters = 200
-learning_rate = 3e-4
+BATCH_SIZE = 64 # how many independent sequences will we process in parallel?
+BLOCK_SIZE = 256 # what is the maximum context length for predictions?
+MAX_ITERS = 5000
+EVAL_INTERVAL = 500
+EVAL_ITERS = 100
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-n_embd = 140 
-n_head = 2
-n_layer = 4
-dropout = 0.2
+N_EMBD = 140 
+N_HEAD = 2
+N_LAYER = 4
+DROPOUT = 0.2
 
 torch.manual_seed(1337)
 
@@ -347,9 +346,9 @@ os.makedirs('outputs', exist_ok=True)
 os.makedirs('weights', exist_ok=True)
 
 def get_batch(data):
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([data[i:i+block_size] for i in ix])
-    y = torch.stack([data[i+1:i+block_size+1] for i in ix])
+    ix = torch.randint(len(data) - BLOCK_SIZE, (BATCH_SIZE,))
+    x = torch.stack([data[i:i+BLOCK_SIZE] for i in ix])
+    y = torch.stack([data[i+1:i+BLOCK_SIZE+1] for i in ix])
     x, y = x.to(device), y.to(device)
     return x, y
 
@@ -358,8 +357,8 @@ def estimate_train_val_loss(model, train_data, val_data):
     out = {}
     model.eval()
     for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
+        losses = torch.zeros(EVAL_ITERS)
+        for k in range(EVAL_ITERS):
             X, Y = get_batch(train_data) if split == "train" else get_batch(val_data)
             logits, loss = model(X, Y)
             losses[k] = loss.item()
@@ -371,9 +370,9 @@ def estimate_train_val_loss(model, train_data, val_data):
 def estimate_test_loss(model, test_data, test_iters=500):
     losses = torch.zeros(test_iters, device=device)
     for k in tqdm(range(test_iters)):
-        ix = torch.randint(len(test_data) - block_size, (batch_size,)).to(device)
-        x = torch.stack([test_data[i:i+block_size] for i in ix]).to(device)
-        y = torch.stack([test_data[i+1:i+block_size+1] for i in ix]).to(device)
+        ix = torch.randint(len(test_data) - BLOCK_SIZE, (BATCH_SIZE,)).to(device)
+        x = torch.stack([test_data[i:i+BLOCK_SIZE] for i in ix]).to(device)
+        y = torch.stack([test_data[i+1:i+BLOCK_SIZE+1] for i in ix]).to(device)
         _, loss = model(x, y)
         losses[k] = loss.item()
     return losses.mean(), losses.std()
@@ -384,12 +383,12 @@ class Head(nn.Module):
 
     def __init__(self, head_size, bias=False):
         super().__init__()
-        self.key = nn.Linear(n_embd, head_size, bias=bias)
-        self.query = nn.Linear(n_embd, head_size, bias=bias)
-        self.value = nn.Linear(n_embd, head_size, bias=bias)
-        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+        self.key = nn.Linear(N_EMBD, head_size, bias=bias)
+        self.query = nn.Linear(N_EMBD, head_size, bias=bias)
+        self.value = nn.Linear(N_EMBD, head_size, bias=bias)
+        self.register_buffer('tril', torch.tril(torch.ones(BLOCK_SIZE, BLOCK_SIZE)))
 
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(DROPOUT)
 
     def forward(self, x):
         # input of size (batch, time-step, channels)
@@ -414,8 +413,8 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size, bias=False):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size, bias=bias) for _ in range(num_heads)])
-        self.proj = nn.Linear(head_size * num_heads, n_embd)
-        self.dropout = nn.Dropout(dropout)
+        self.proj = nn.Linear(head_size * num_heads, N_EMBD)
+        self.dropout = nn.Dropout(DROPOUT)
 
     def forward(self, x):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
@@ -432,7 +431,7 @@ class FeedFoward(nn.Module):
             nn.Linear(n_embd, 4 * n_embd),
             nn.ReLU(),
             nn.Linear(4 * n_embd, n_embd),
-            nn.Dropout(dropout),
+            nn.Dropout(DROPOUT),
         )
 
     def forward(self, x):
@@ -481,7 +480,7 @@ class GPTLanguageModel(nn.Module):
         super().__init__()
         # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
-        self.position_embedding_table = nn.Embedding(block_size, n_embd)
+        self.position_embedding_table = nn.Embedding(BLOCK_SIZE, n_embd)
         if skip:
             self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head, bias=bias) for _ in range(n_layer)])
         else:
@@ -517,7 +516,7 @@ class GPTLanguageModel(nn.Module):
             B, T, C = logits.shape
             logits = logits.view(B*T, C)
             targets = targets.view(B*T)
-            loss = F.cross_entropy(logits, targets, reduction="sum")
+            loss = F.cross_entropy(logits, targets)
 
         return logits, loss
 
@@ -525,7 +524,7 @@ class GPTLanguageModel(nn.Module):
         # idx is (B, T) array of indices in the current context
         for _ in range(max_new_tokens):
             # crop idx to the last block_size tokens
-            idx_cond = idx[:, -block_size:]
+            idx_cond = idx[:, -BLOCK_SIZE:]
             # get the predictions
             logits, loss = self(idx_cond)
             # focus only on the last time step
@@ -539,12 +538,12 @@ class GPTLanguageModel(nn.Module):
         return idx
 
 
-def train_transformer_const(model, train_data, val_data, output_name=None):
-    optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
+def train_transformer_const(model, train_data, val_data, alpha0=1e-3, output_name=None):
+    optimizer = torch.optim.SGD(model.parameters(), lr=alpha0)
     losses = []
 
-    for iter in tqdm(range(max_iters)):
-        if iter % eval_interval == 0 or iter == max_iters - 1:
+    for iter in tqdm(range(1, MAX_ITERS+1)):
+        if iter == 1 or iter % EVAL_INTERVAL == 0 or iter == MAX_ITERS:
             losses.append(estimate_train_val_loss(model, train_data, val_data))   
 
         xb, yb = get_batch(train_data)
@@ -554,34 +553,34 @@ def train_transformer_const(model, train_data, val_data, output_name=None):
         optimizer.step()
     
     if output_name is None:
-        output_name = f"const_{max_iters}"
+        output_name = f"const_{MAX_ITERS}"
     torch.save(model.state_dict(), f'weights/{output_name}.pth')
 
-    x = [(i+1)*eval_interval for i in range(max_iters//eval_interval)]
+    x = [(i+1)*EVAL_INTERVAL for i in range(MAX_ITERS//EVAL_INTERVAL)]
     mean_train_loss = [loss['train'][0] for loss in losses[1:]]
     mean_val_loss = [loss['val'][0] for loss in losses[1:]]
     std_train_loss = [loss['train'][1] for loss in losses[1:]]
     std_val_loss = [loss['val'][1] for loss in losses[1:]]
 
-    print(f"Training loss: {mean_train_loss[-1]}")
-    print(f"Validation loss: {mean_val_loss[-1]}")
+    print(f"Final Training loss: Mean {mean_train_loss[-1]}, Std {std_train_loss[-1]}")
+    print(f"Final Validation loss: Mean {mean_val_loss[-1]}, Std {std_val_loss[-1]}")
 
     plt.figure(figsize=(7,4))
     plt.errorbar(x, mean_train_loss, std_train_loss, label="train")
     plt.errorbar(x, mean_val_loss, std_val_loss, label="val")
-    plt.title(f"Loss during Training - {n_embd=}, {n_head=}, {n_layer=}")
+    plt.title(f"Loss during Training $\\alpha_0 = {alpha0}, N={BATCH_SIZE}$")
     plt.xlabel("No. iterations")
-    plt.ylabel("Loss")
+    plt.ylabel("Crossentropy Loss")
     plt.legend(fancybox=True)
     plt.tight_layout()
     plt.savefig(f'images/{output_name}.svg')
 
-def train_transformer_adam(model, train_data, val_data, output_name=None):
-    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+def train_transformer_adam(model, train_data, val_data, alpha0=3e-4, beta1=0.9, beta2=0.999, output_name=None):
+    optimizer = torch.optim.Adam(model.parameters(), lr=alpha0, betas=(beta1, beta2))
     losses = []
 
-    for iter in tqdm(range(max_iters)):
-        if iter % eval_interval == 0 or iter == max_iters - 1:
+    for iter in tqdm(range(MAX_ITERS)):
+        if iter % EVAL_INTERVAL == 0 or iter == MAX_ITERS - 1:
             losses.append(estimate_train_val_loss(model, train_data, val_data))   
 
         xb, yb = get_batch(train_data)
@@ -591,34 +590,34 @@ def train_transformer_adam(model, train_data, val_data, output_name=None):
         optimizer.step()
     
     if output_name is None:
-        output_name = f"const_{max_iters}"
+        output_name = f"adam_{MAX_ITERS}"
     torch.save(model.state_dict(), f'weights/{output_name}.pth')
 
-    x = [(i+1)*eval_interval for i in range(max_iters//eval_interval)]
+    x = [(i+1)*EVAL_INTERVAL for i in range(MAX_ITERS//EVAL_INTERVAL)]
     mean_train_loss = [loss['train'][0] for loss in losses[1:]]
     mean_val_loss = [loss['val'][0] for loss in losses[1:]]
     std_train_loss = [loss['train'][1] for loss in losses[1:]]
     std_val_loss = [loss['val'][1] for loss in losses[1:]]
 
-    print(f"Training loss: {mean_train_loss[-1]}")
-    print(f"Validation loss: {mean_val_loss[-1]}")
+    print(f"Final Training loss: Mean {mean_train_loss[-1]}, Std {std_train_loss[-1]}")
+    print(f"Final Validation loss: Mean {mean_val_loss[-1]}, Std {std_val_loss[-1]}")
 
     plt.figure(figsize=(7,4))
     plt.errorbar(x, mean_train_loss, std_train_loss, label="train")
     plt.errorbar(x, mean_val_loss, std_val_loss, label="val")
-    plt.title(f"Loss during Training - {n_embd=}, {n_head=}, {n_layer=}")
+    plt.title(f"Loss during Training $\\alpha_0 = {alpha0}, \\beta_1 = {beta1}, \\beta_2 = {beta2}, N={BATCH_SIZE}$")
     plt.xlabel("No. iterations")
-    plt.ylabel("Loss")
+    plt.ylabel("Crossentropy Loss")
     plt.legend(fancybox=True)
     plt.tight_layout()
     plt.savefig(f'images/{output_name}.svg')
 
 def train_transformer_polyak(model, train_data, val_data, output_name=None):
-    optimizer = PolyakSGD(model.parameters())
+    optimizer = PolyakSGD(model.parameters(), batch_size=BATCH_SIZE, mean_reduce=True)
     losses = []
 
-    for iter in tqdm(range(max_iters)):
-        if iter % eval_interval == 1 or iter == max_iters - 1:
+    for iter in tqdm(range(MAX_ITERS)):
+        if iter % EVAL_INTERVAL == 1 or iter == MAX_ITERS - 1:
             losses.append(estimate_train_val_loss(model, train_data, val_data))   
         
         def closure():
@@ -630,24 +629,24 @@ def train_transformer_polyak(model, train_data, val_data, output_name=None):
         optimizer.step(closure)
     
     if output_name is None:
-        output_name = f"polyak_{max_iters}"
+        output_name = f"polyak_{MAX_ITERS}"
     torch.save(model.state_dict(), f'weights/{output_name}.pth')
 
-    x = [(i+1)*eval_interval for i in range(max_iters//eval_interval)]
+    x = [(i+1)*EVAL_INTERVAL for i in range(MAX_ITERS//EVAL_INTERVAL)]
     mean_train_loss = [loss['train'][0] for loss in losses[1:]]
     mean_val_loss = [loss['val'][0] for loss in losses[1:]]
     std_train_loss = [loss['train'][1] for loss in losses[1:]]
     std_val_loss = [loss['val'][1] for loss in losses[1:]]
 
-    print(f"Training loss: {mean_train_loss[-1]}")
-    print(f"Validation loss: {mean_val_loss[-1]}")
+    print(f"Final Training loss: Mean {mean_train_loss[-1]}, Std {std_train_loss[-1]}")
+    print(f"Final Validation loss: Mean {mean_val_loss[-1]}, Std {std_val_loss[-1]}")
 
     plt.figure(figsize=(7,4))
     plt.errorbar(x, mean_train_loss, std_train_loss, label="train")
     plt.errorbar(x, mean_val_loss, std_val_loss, label="val")
-    plt.title(f"Loss during Training - {n_embd=}, {n_head=}, {n_layer=}")
+    plt.title(f"Loss during Training $N={BATCH_SIZE}$")
     plt.xlabel("No. iterations")
-    plt.ylabel("Loss")
+    plt.ylabel("Crossentropy Loss")
     plt.legend(fancybox=True)
     plt.tight_layout()
     plt.savefig(f'images/{output_name}.svg')
@@ -999,153 +998,38 @@ if __name__ == "__main__":
     # ----------------------------------------------------------------------- #
     # q1 (d)
     # ----------------------------------------------------------------------- #
-    # train_path = "input_childSpeech_trainingSet.txt"
-    # with open(train_path) as f:
-    #     train_text = f.read()
-    # chars = sorted(list(set(train_text)))
-    # stoi = { ch:i for i,ch in enumerate(chars) }
-    # encode = lambda s: [stoi[c] for c in s]
-    # train_data = torch.tensor(encode(train_text), dtype=torch.long)
-    # split = int(0.9*len(train_data))
-    # train_data, val_data = train_data[:split], train_data[split:]
+    train_path = "input_childSpeech_trainingSet.txt"
+    with open(train_path) as f:
+        train_text = f.read()
+    chars = sorted(list(set(train_text)))
+    stoi = { ch:i for i,ch in enumerate(chars) }
+    encode = lambda s: [stoi[c] for c in s]
+    train_data = torch.tensor(encode(train_text), dtype=torch.long)
+    split = int(0.9*len(train_data))
+    train_data, val_data = train_data[:split], train_data[split:]
     
-    # test_path = "input_childSpeech_testSet.txt"
-    # with open(test_path) as f:
-    #     test_text = f.read()
-    # test_data = torch.tensor(encode(test_text), dtype=torch.long)
+    test_path = "input_childSpeech_testSet.txt"
+    with open(test_path) as f:
+        test_text = f.read()
+    test_data = torch.tensor(encode(test_text), dtype=torch.long)
 
-    # model = GPTLanguageModel(len(chars), n_embd, n_head, n_layer).to(device)
-    # print("-"*80,f'Initial Model: {sum(p.numel() for p in model.parameters())/1e6:0.4f}M parameters', sep="\n")
-    # train_transformer_polyak(model, train_data, val_data)
-    # mean_model_loss, std_model_loss = estimate_test_loss(model, test_data)
-    # print(f"Polyak test loss: Mean {mean_model_loss:0.4f}, Standard Deviation: {std_model_loss:0.4f}")
+    BATCH_SIZE = 8
+    model = GPTLanguageModel(len(chars), N_EMBD, N_HEAD, N_LAYER).to(device)
+    print("-"*80,f'Initial Model: {sum(p.numel() for p in model.parameters())/1e6:0.4f}M parameters', sep="\n")
+    train_transformer_polyak(model, train_data, val_data)
+    mean_model_loss, std_model_loss = estimate_test_loss(model, test_data)
+    print(f"Polyak test loss: Mean {mean_model_loss:0.4f}, Standard Deviation: {std_model_loss:0.4f}")
 
-    # model = GPTLanguageModel(len(chars), n_embd, n_head, n_layer).to(device)
-    # print("-"*80,f'Initial Model: {sum(p.numel() for p in model.parameters())/1e6:0.4f}M parameters', sep="\n")
-    # train_transformer_const(model, train_data, val_data)
-    # mean_model_loss, std_model_loss = estimate_test_loss(model, test_data)
-    # print(f"Constant test loss: Mean {mean_model_loss:0.4f}, Standard Deviation: {std_model_loss:0.4f}")
+    BATCH_SIZE = 64
+    model = GPTLanguageModel(len(chars), N_EMBD, N_HEAD, N_LAYER).to(device)
+    print("-"*80,f'Initial Model: {sum(p.numel() for p in model.parameters())/1e6:0.4f}M parameters', sep="\n")
+    train_transformer_const(model, train_data, val_data, alpha0=4e-2)
+    mean_model_loss, std_model_loss = estimate_test_loss(model, test_data)
+    print(f"Constant test loss: Mean {mean_model_loss:0.4f}, Standard Deviation: {std_model_loss:0.4f}")
 
-    # model = GPTLanguageModel(len(chars), n_embd, n_head, n_layer).to(device)
-    # print("-"*80,f'Initial Model: {sum(p.numel() for p in model.parameters())/1e6:0.4f}M parameters', sep="\n")
-    # train_transformer_adam(model, train_data, val_data)
-    # mean_model_loss, std_model_loss = estimate_test_loss(model, test_data)
-    # print(f"Adam test loss: Mean {mean_model_loss:0.4f}, Standard Deviation: {std_model_loss:0.4f}")
-
-    # ----------------------------------------------------------------------- #
-    # q1 (e)
-    # ----------------------------------------------------------------------- #
-    runs = 20
-    max_iters = 100
-    data_size = 100
-    batch_size = 25
-    alpha0 = 1e-2
-
-    epochs = max_iters*batch_size//data_size    
-    iters = [i+1 for i in range(max_iters)]
-    plt.figure(figsize=(12, 6))
-
-    for sigma in [0.5, 0.1, 0.05, 0.01]:
-        X = (2*torch.rand(data_size)-1).view(-1, 1)
-        Y = 5*X + 2 + sigma*torch.randn(data_size).view(-1, 1)
-
-        dataset = torch.utils.data.TensorDataset(X, Y)
-        batchloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-        polyak_loss = np.zeros((runs, max_iters))
-        for run in range(runs):
-            losses = np.zeros(max_iters)
-            model = LinearRegressionModel()
-            optim = PolyakAdam(model.parameters())
-            for i in range(epochs):
-                for j, (x, y) in enumerate(batchloader):
-                    def closure():
-                        optim.zero_grad()
-                        loss = F.mse_loss(model(x), y, reduction="sum")
-                        loss.backward()
-                        return loss
-                    loss, alpha = optim.step(closure)
-                    losses[(data_size//batch_size)*i + j] = float(loss)
-            polyak_loss[run] = losses
-
-        const_loss = np.zeros((runs, max_iters))
-        for run in range(runs):
-            losses = np.zeros(max_iters)
-            model = LinearRegressionModel()
-            optim = torch.optim.SGD(model.parameters(), lr=alpha0)
-            for i in range(epochs):
-                for j, (x, y) in enumerate(batchloader):
-                    optim.zero_grad()
-                    loss = F.mse_loss(model(x), y, reduction="sum")
-                    loss.backward()
-                    optim.step()
-                    losses[(data_size//batch_size)*i + j] = float(loss)
-            const_loss[run] = losses
-
-        plt.errorbar(iters, const_loss.mean(axis=0), const_loss.std(axis=0), linestyle="dashed", label=f"Constant $\\sigma = {sigma}$")
-        plt.errorbar(iters, polyak_loss.mean(axis=0), polyak_loss.std(axis=0), label=f"Polyak $\\sigma = {sigma}$")
-
-    plt.yscale("log")
-    plt.xlabel("No. Iterations")
-    plt.ylabel("Function Value")
-    plt.title(f"Minibatch SGD Constant ($\\alpha={alpha0:.1e}$) vs Adam Polyak Step Size with $N={batch_size}$, {runs} runs each)")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig("images//adam_lr_noise.svg")
-    plt.show()
-    plt.close()
-
-    plt.figure(figsize=(12, 6))
-    for batch_size in [2, 10, 20, 50]:
-        sigma = 0.05
-        epochs = max_iters*batch_size//data_size   
-        X = (2*torch.rand(data_size)-1).view(-1, 1)
-        Y = 5*X + 2 + sigma*torch.randn(data_size).view(-1, 1)
-
-        dataset = torch.utils.data.TensorDataset(X, Y)
-        batchloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-        polyak_loss = np.zeros((runs, max_iters))
-        polyak_params = np.zeros((runs, max_iters))
-        for run in range(runs):
-            losses = np.zeros(max_iters)
-            model = LinearRegressionModel()
-            optim = PolyakAdam(model.parameters())
-            for i in range(epochs):
-                for j, (x, y) in enumerate(batchloader):
-                    def closure():
-                        optim.zero_grad()
-                        loss = F.mse_loss(model(x), y, reduction="sum")
-                        loss.backward()
-                        return loss
-                    loss, alpha = optim.step(closure)
-                    losses[(data_size//batch_size)*i + j] = float(loss)
-            polyak_loss[run] = losses
-
-        const_loss = np.zeros((runs, max_iters))
-        for run in range(runs):
-            losses = np.zeros(max_iters)
-            model = LinearRegressionModel()
-            optim = torch.optim.SGD(model.parameters(), lr=alpha0)
-            for i in range(epochs):
-                for j, (x, y) in enumerate(batchloader):
-                    optim.zero_grad()
-                    loss = F.mse_loss(model(x), y, reduction="sum")
-                    loss.backward()
-                    optim.step()
-                    losses[(data_size//batch_size)*i + j] = float(loss)
-            const_loss[run] = losses
-
-        plt.errorbar(iters, const_loss.mean(axis=0), const_loss.std(axis=0), linestyle="dashed", label=f"Constant $N = {batch_size}$")
-        plt.errorbar(iters, polyak_loss.mean(axis=0), polyak_loss.std(axis=0), label=f"Polyak $N = {batch_size}$")
-
-    plt.yscale("log")
-    plt.xlabel("No. Iterations")
-    plt.ylabel("Function Value")
-    plt.title(f"Minibatch SGD Constant ($\\alpha={alpha0:.1e}$) vs Adam Polyak Step Size with $\\sigma={sigma}$, {runs} runs each)")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig("images//adam_lr_batch.svg")
-    plt.show()
-    plt.close()
-    # ----------------------------------------------------------------------- #
+    BATCH_SIZE = 32
+    model = GPTLanguageModel(len(chars), N_EMBD, N_HEAD, N_LAYER).to(device)
+    print("-"*80,f'Initial Model: {sum(p.numel() for p in model.parameters())/1e6:0.4f}M parameters', sep="\n")
+    train_transformer_adam(model, train_data, val_data, alpha0=1.1e-4, beta1=0.843, beta2=0.996)
+    mean_model_loss, std_model_loss = estimate_test_loss(model, test_data)
+    print(f"Adam test loss: Mean {mean_model_loss:0.4f}, Standard Deviation: {std_model_loss:0.4f}")
