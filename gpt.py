@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import matplotlib.pyplot as plt
-import torch.optim.optimizer as optimizer
+from torch.optim.optimizer import ParamsT
 from tqdm import tqdm
 import numpy as np
 
@@ -13,15 +13,19 @@ import numpy as np
 class PolyakSGD(torch.optim.Optimizer):
     def __init__(
         self,
-        params: optimizer.ParamsT,
+        params: ParamsT,
         eps: float = 1e-8,
         fstar: float = 0.0,
         verbose: bool = False,
+        mean_reduce: bool = False,
+        batch_size: int = 0,
     ):
         defaults = dict(
             eps=eps,
             fstar=fstar,
             verbose=verbose,
+            mean_reduce=mean_reduce,
+            batch_size=batch_size
         )
         super().__init__(params, defaults)
 
@@ -29,6 +33,8 @@ class PolyakSGD(torch.optim.Optimizer):
             raise ValueError("PolyakSGD doesn't support per-parameter options (parameter groups)")
         if eps<0 or eps>1:
             raise ValueError("Epsilon must be positive and should be small")
+        if mean_reduce and batch_size<1:
+            raise ValueError("Batch size must be an integer greater than 1")
         
         self._params = self.param_groups[0]["params"]
         self._numel_cache = None
@@ -43,8 +49,11 @@ class PolyakSGD(torch.optim.Optimizer):
         loss = closure()
 
         flat_grad = self._gather_flat_grad()
-        gradsq = float(flat_grad@flat_grad)
-        alpha = (float(loss) - group['fstar']) / (gradsq + group["eps"])
+        gradsq = float(flat_grad.dot(flat_grad))
+        if group['mean_reduce']:
+            alpha = (float(loss)*group['batch_size'] - group['fstar']) / (gradsq*group['batch_size']**2 + group["eps"])
+        else:
+            alpha = (float(loss) - group['fstar']) / (gradsq + group["eps"])
         if group["verbose"]:
             print(f"loss: {float(loss):0.2f}, grad^2 {gradsq:0.2f}, alpha: {float(alpha):0.4f}")
         self._add_grad(-alpha, flat_grad)
@@ -159,7 +168,6 @@ def test_batch_sum_reduction():
         loss.backward()
         return loss
 
-    # Forward pass
     loss, alpha = optimizer.step(closure)
     # x_pred = [1*1 + 2*1, 1*1 + 2*1] = [3,3]
     # loss =  sum(x_pred - y)^2 = (3-1)^2 + (3-1)^2 = 8
@@ -171,9 +179,154 @@ def test_batch_sum_reduction():
     gradsq = 128.0 # gradsq = 2*64 = 128
     expected_alpha = (float(loss) - fstar) / (gradsq + eps)  # alpha = 0.0625
     assert torch.allclose(torch.tensor(alpha), torch.tensor(expected_alpha), atol=1e-6)
+
+def test_batch_mean_reduction():
+    fstar = 0; eps = 1e-8; batch_size = 2
+    model = torch.nn.Linear(2, 1, bias=False)
+    model.weight.data = torch.tensor([[1.0, 2.0]], requires_grad=True)
+    optimizer = PolyakSGD(model.parameters(), batch_size=batch_size, mean_reduce=True, fstar=fstar, eps=eps, verbose=True)
+    X = torch.ones(2, 2)  # batch size 2
+    y = torch.ones(2, 1)
+
+    def closure():
+        optimizer.zero_grad()
+        loss = F.mse_loss(model(X), y, reduction="mean")
+        loss.backward()
+        return loss
+
+    loss, alpha = optimizer.step(closure)
+    # x_pred = [1*1 + 2*1, 1*1 + 2*1] = [3,3]
+    # loss =  avg(x_pred - y)^2 = 1/2((3-1)^2 + (3-1)^2) = 4
+    # grad_i = 2*(x_pred_i-y_i) avg over batch
+    # grad = 1/2([2*2, 2*2] + [2*2, 2*2])  = [4, 4]
+    manual_grad = torch.tensor([[4.0, 4.0]])
+    assert torch.allclose(model.weight.grad, manual_grad, atol=1e-6)
+
+    gradsq = 32.0 # gradsq = 2*16 = 32
+    expected_alpha = (float(loss)*batch_size - fstar) / (gradsq*batch_size**2 + eps)  # alpha = 0.0625
+    assert torch.allclose(torch.tensor(alpha), torch.tensor(expected_alpha), atol=1e-6)
+
+
+
+class PolyakAdam(torch.optim.Optimizer):
+    def __init__(
+        self,
+        params: ParamsT,
+        eps: float = 1e-8,
+        fstar: float = 0.0,
+        beta1: float = 0.9,
+        beta2: float = 0.999,
+        verbose: bool = False,
+        mean_reduce: bool = False,
+        batch_size: int = 0,
+    ):
+        defaults = dict(
+            eps=eps,
+            fstar=fstar,
+            beta1=beta1,
+            beta2=beta2,
+            verbose=verbose,
+            mean_reduce=mean_reduce,
+            batch_size=batch_size
+        )
+        self._step = 0
+        self._z = None
+        self._v = None
+        super().__init__(params, defaults)
+
+        if len(self.param_groups) != 1:
+            raise ValueError("PolyakSGD doesn't support per-parameter options (parameter groups)")
+        if eps<0 or eps>1:
+            raise ValueError("Epsilon must be positive and should be small")
+        if beta1<0 or beta1>1:
+            raise ValueError("Beta1 must be in te range [0,1]")
+        if beta2<0 or beta2>1:
+            raise ValueError("Beta2 must be in te range [0,1]")
+        if mean_reduce and batch_size<1:
+            raise ValueError("Batch size must be an integer greater than 1")
+        
+        self._params = self.param_groups[0]["params"]
+        self._numel_cache = None
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+
+    @torch.no_grad()
+    def step(self, closure):
+        group = self.param_groups[0]
+        closure = torch.enable_grad()(closure)
+        loss = closure()
+
+        flat_grad = self._gather_flat_grad()
+        gradsq = float(flat_grad.dot(flat_grad))
+        if group['mean_reduce']:
+            alpha0 = (float(loss)*group['batch_size'] - group['fstar']) / (gradsq*group['batch_size']**2 + group["eps"])
+        else:
+            alpha0 = (float(loss) - group['fstar']) / (gradsq + group["eps"])
+
+        self._step += 1
+        if self._z is None:
+            self._z = group["beta1"]*flat_grad.copy_()
+        else:
+            self._z = group["beta1"]*self._z + (1-group["beta1"])*flat_grad.copy_()
+        if self._v is None:
+            self._v = group["beta2"]*flat_grad.copy_().pow(2)
+        else:
+            self._v = group["beta2"]*self._v + (1-group["beta2"])*flat_grad.copy_().pow(2)
+        zhat = self._z/(1-group["beta1"]**(self._step))
+        vhat = self._v/(1-group["beta2"]**(self._step))
+
+        alpha *= zhat/(vhat+group["eps"])
+        if group["verbose"]:
+            print(f"loss: {float(loss):0.2f}, grad^2 {gradsq:0.2f}, alpha: {float(alpha0):0.4f}")
+
+        self._add_grad(-alpha, flat_grad)
+
+        return loss, alpha
+    
+    def _gather_flat_grad(self):
+        views = []
+        for p in self._params:
+            if p.grad is None:
+                view = p.new(p.numel()).zero_()
+            elif p.grad.is_sparse:
+                view = p.grad.to_dense().view(-1)
+            else:
+                view = p.grad.view(-1)
+            views.append(view)
+        return torch.cat(views, 0)
+    
+    def _add_grad(self, step_size, update):
+        offset = 0
+        for p in self._params:
+            numel = p.numel()
+            p.add_(update[offset : offset + numel].view_as(p), alpha=step_size)
+            offset += numel
 # --------------------------------------------------------------------------- #
 
-# --------------------------------------------------------------------------- #
+# -----------------------------------------------------------------------------#
+# Code obtained from https://www.scss.tcd.ie/Doug.Leith/CS7DS2/week6.php
+# -----------------------------------------------------------------------------#
+class Week6LossFunction():
+    def generate_trainingdata(self, m=25):
+        #return np.array([0, 0])+0.25*np.random.randn(m, 2)
+        return torch.tensor(np.array([0, 0])+0.25*np.random.randn(m, 2))
+
+    def f(self, x, minibatch):
+        # loss function sum_{w in training data} f(x,w)
+        y = 0
+        count = 0
+        for w in minibatch:
+            z = x-w-1
+            y += torch.minimum(34*(z[0]**2+z[1]**2), (z[0]+6)**2+(z[1]+8)**2)
+            count = count+1
+        return y/count
+# -----------------------------------------------------------------------------#
+
+
+# -----------------------------------------------------------------------------#
+# Code obtained from Week 9 ML Assignment
+# -----------------------------------------------------------------------------#
 # hyperparameters
 batch_size = 64 # how many independent sequences will we process in parallel?
 block_size = 256 # what is the maximum context length for predictions?
@@ -500,7 +653,6 @@ def train_transformer_polyak(model, train_data, val_data, output_name=None):
     plt.savefig(f'images/{output_name}.svg')
 # --------------------------------------------------------------------------- #
 
-
 class LinearRegressionModel(nn.Module):
     def __init__(self):
         super().__init__()
@@ -513,169 +665,487 @@ class LinearRegressionModel(nn.Module):
 
 if __name__ == "__main__":
     
-    # # ----------------------------------------------------------------------- #
-    # # q1 (a)
-    # # ----------------------------------------------------------------------- #
-    # print("Tests\n"+"-"*40)
-    # test_alpha_calc()
-    # test_zero_grad()
-    # test_loss_equals_fstar()
-    # test_eps_stability()
-    # test_batch_sum_reduction()
-    # test_closure_call_count()
-    # # ----------------------------------------------------------------------- #
+    # ----------------------------------------------------------------------- #
+    # q1 (a)
+    # ----------------------------------------------------------------------- #
+    print("Polyak Tests\n"+"-"*40)
+    test_alpha_calc()
+    test_zero_grad()
+    test_loss_equals_fstar()
+    test_eps_stability()
+    test_batch_sum_reduction()
+    test_batch_mean_reduction()
+    test_closure_call_count()
+    print("-"*40)
+    # ----------------------------------------------------------------------- #
     
-    # # ----------------------------------------------------------------------- #
-    # # q1 (b)
-    # # ----------------------------------------------------------------------- #
-    # print("-"*40+"\nSimple Linear Regression\n"+"-"*40)
-    # runs = 20
-    # max_iters = 100
-    # data_size = 100
-    # batch_size = 25
-    # alpha0 = 1e-3
+    # ----------------------------------------------------------------------- #
+    # q1 (b)
+    # ----------------------------------------------------------------------- #
+    runs = 20
+    max_iters = 100
+    data_size = 100
+    batch_size = 25
+    alpha0 = 1e-2
 
-    # epochs = max_iters*batch_size//data_size    
-    # iters = [i+1 for i in range(max_iters)]
-    # plt.figure(figsize=(12, 6))
+    epochs = max_iters*batch_size//data_size    
+    iters = [i+1 for i in range(max_iters)]
+    plt.figure(figsize=(12, 6))
 
-    # for sigma in [0.5, 0.1, 0.05, 0.01]:
-    #     X = (2*torch.rand(data_size)-1).view(-1, 1)
-    #     Y = 5*X + 2 + sigma*torch.randn(data_size).view(-1, 1)
+    for sigma in [0.5, 0.1, 0.05, 0.01]:
+        X = (2*torch.rand(data_size)-1).view(-1, 1)
+        Y = 5*X + 2 + sigma*torch.randn(data_size).view(-1, 1)
 
-    #     dataset = torch.utils.data.TensorDataset(X, Y)
-    #     batchloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        dataset = torch.utils.data.TensorDataset(X, Y)
+        batchloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-    #     polyak_loss = np.zeros((runs, max_iters))
-    #     polyak_params = np.zeros((runs, max_iters))
-    #     for run in range(runs):
-    #         losses = np.zeros(max_iters)
-    #         model = LinearRegressionModel()
-    #         optim = PolyakSGD(model.parameters())
-    #         for i in range(epochs):
-    #             for j, (x, y) in enumerate(batchloader):
-    #                 def closure():
-    #                     optim.zero_grad()
-    #                     loss = torch.sum((model(x)-y)**2)
-    #                     loss.backward()
-    #                     return loss
-    #                 loss, alpha = optim.step(closure)
-    #                 losses[(data_size//batch_size)*i + j] = float(loss)
-    #         polyak_loss[run] = losses
+        polyak_loss = np.zeros((runs, max_iters))
+        for run in range(runs):
+            losses = np.zeros(max_iters)
+            model = LinearRegressionModel()
+            optim = PolyakSGD(model.parameters())
+            for i in range(epochs):
+                for j, (x, y) in enumerate(batchloader):
+                    def closure():
+                        optim.zero_grad()
+                        loss = F.mse_loss(model(x), y, reduction="sum")
+                        loss.backward()
+                        return loss
+                    loss, alpha = optim.step(closure)
+                    losses[(data_size//batch_size)*i + j] = float(loss)
+            polyak_loss[run] = losses
 
-    #     const_loss = np.zeros((runs, max_iters))
-    #     for run in range(runs):
-    #         losses = np.zeros(max_iters)
-    #         model = LinearRegressionModel()
-    #         optim = torch.optim.SGD(model.parameters(), lr=alpha0)
-    #         for i in range(epochs):
-    #             for j, (x, y) in enumerate(batchloader):
-    #                 optim.zero_grad()
-    #                 loss = torch.sum((model(x)-y)**2)
-    #                 loss.backward()
-    #                 optim.step()
-    #                 losses[(data_size//batch_size)*i + j] = float(loss)
-    #         const_loss[run] = losses
+        const_loss = np.zeros((runs, max_iters))
+        for run in range(runs):
+            losses = np.zeros(max_iters)
+            model = LinearRegressionModel()
+            optim = torch.optim.SGD(model.parameters(), lr=alpha0)
+            for i in range(epochs):
+                for j, (x, y) in enumerate(batchloader):
+                    optim.zero_grad()
+                    loss = F.mse_loss(model(x), y, reduction="sum")
+                    loss.backward()
+                    optim.step()
+                    losses[(data_size//batch_size)*i + j] = float(loss)
+            const_loss[run] = losses
 
-    #     plt.errorbar(iters, const_loss.mean(axis=0), const_loss.std(axis=0), linestyle="dashed", label=f"Constant $\\sigma = {sigma}$")
-    #     plt.errorbar(iters, polyak_loss.mean(axis=0), polyak_loss.std(axis=0), label=f"Polyak $\\sigma = {sigma}$")
+        plt.errorbar(iters, const_loss.mean(axis=0), const_loss.std(axis=0), linestyle="dashed", label=f"Constant $\\sigma = {sigma}$")
+        plt.errorbar(iters, polyak_loss.mean(axis=0), polyak_loss.std(axis=0), label=f"Polyak $\\sigma = {sigma}$")
 
-    # plt.yscale("log")
-    # plt.xlabel("No. Iterations")
-    # plt.ylabel("Function Value")
-    # plt.title(f"Minibatch SGD Constant ($\\alpha={alpha0:.1e}$) vs Polyak Step Size ($N={batch_size}$, {runs} runs each)")
-    # plt.legend()
-    # plt.tight_layout()
-    # #plt.show()
-    # plt.savefig("images//lr_noise.svg")
+    plt.yscale("log")
+    plt.xlabel("No. Iterations")
+    plt.ylabel("Function Value")
+    plt.title(f"Minibatch SGD Constant ($\\alpha={alpha0:.1e}$) vs Polyak Step Size with $N={batch_size}$, {runs} runs each)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("images//lr_noise.svg")
+    plt.show()
+    plt.close()
 
 
-    # plt.figure(figsize=(12, 6))
-    # for batch_size in [2, 10, 20, 50]:
-    #     sigma = 0.05
-    #     epochs = max_iters*batch_size//data_size   
-    #     X = (2*torch.rand(data_size)-1).view(-1, 1)
-    #     Y = 5*X + 2 + sigma*torch.randn(data_size).view(-1, 1)
+    plt.figure(figsize=(12, 6))
+    for batch_size in [2, 10, 20, 50]:
+        sigma = 0.05
+        epochs = max_iters*batch_size//data_size   
+        X = (2*torch.rand(data_size)-1).view(-1, 1)
+        Y = 5*X + 2 + sigma*torch.randn(data_size).view(-1, 1)
 
-    #     dataset = torch.utils.data.TensorDataset(X, Y)
-    #     batchloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        dataset = torch.utils.data.TensorDataset(X, Y)
+        batchloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-    #     polyak_loss = np.zeros((runs, max_iters))
-    #     polyak_params = np.zeros((runs, max_iters))
-    #     for run in range(runs):
-    #         losses = np.zeros(max_iters)
-    #         model = LinearRegressionModel()
-    #         optim = PolyakSGD(model.parameters())
-    #         for i in range(epochs):
-    #             for j, (x, y) in enumerate(batchloader):
-    #                 def closure():
-    #                     optim.zero_grad()
-    #                     loss = torch.sum((model(x)-y)**2)
-    #                     loss.backward()
-    #                     return loss
-    #                 loss, alpha = optim.step(closure)
-    #                 losses[(data_size//batch_size)*i + j] = float(loss)
-    #         polyak_loss[run] = losses
+        polyak_loss = np.zeros((runs, max_iters))
+        polyak_params = np.zeros((runs, max_iters))
+        for run in range(runs):
+            losses = np.zeros(max_iters)
+            model = LinearRegressionModel()
+            optim = PolyakSGD(model.parameters())
+            for i in range(epochs):
+                for j, (x, y) in enumerate(batchloader):
+                    def closure():
+                        optim.zero_grad()
+                        loss = F.mse_loss(model(x), y, reduction="sum")
+                        loss.backward()
+                        return loss
+                    loss, alpha = optim.step(closure)
+                    losses[(data_size//batch_size)*i + j] = float(loss)
+            polyak_loss[run] = losses
 
-    #     const_loss = np.zeros((runs, max_iters))
-    #     for run in range(runs):
-    #         losses = np.zeros(max_iters)
-    #         model = LinearRegressionModel()
-    #         optim = torch.optim.SGD(model.parameters(), lr=alpha0)
-    #         for i in range(epochs):
-    #             for j, (x, y) in enumerate(batchloader):
-    #                 optim.zero_grad()
-    #                 loss = torch.sum((model(x)-y)**2)
-    #                 loss.backward()
-    #                 optim.step()
-    #                 losses[(data_size//batch_size)*i + j] = float(loss)
-    #         const_loss[run] = losses
+        const_loss = np.zeros((runs, max_iters))
+        for run in range(runs):
+            losses = np.zeros(max_iters)
+            model = LinearRegressionModel()
+            optim = torch.optim.SGD(model.parameters(), lr=alpha0)
+            for i in range(epochs):
+                for j, (x, y) in enumerate(batchloader):
+                    optim.zero_grad()
+                    loss = F.mse_loss(model(x), y, reduction="sum")
+                    loss.backward()
+                    optim.step()
+                    losses[(data_size//batch_size)*i + j] = float(loss)
+            const_loss[run] = losses
 
-    #     plt.errorbar(iters, const_loss.mean(axis=0), const_loss.std(axis=0), linestyle="dashed", label=f"Constant $N = {batch_size}$")
-    #     plt.errorbar(iters, polyak_loss.mean(axis=0), polyak_loss.std(axis=0), label=f"Polyak $N = {batch_size}$")
+        plt.errorbar(iters, const_loss.mean(axis=0), const_loss.std(axis=0), linestyle="dashed", label=f"Constant $N = {batch_size}$")
+        plt.errorbar(iters, polyak_loss.mean(axis=0), polyak_loss.std(axis=0), label=f"Polyak $N = {batch_size}$")
 
-    # plt.yscale("log")
-    # plt.xlabel("No. Iterations")
-    # plt.ylabel("Function Value")
-    # plt.title(f"Minibatch SGD Constant ($\\alpha={alpha0:.1e}$) vs Polyak Step Size ($\\sigma={sigma}$, {runs} runs each)")
-    # plt.legend()
-    # plt.tight_layout()
-    # #plt.show()
-    # plt.savefig("images//lr_batch.svg")
-    # # ----------------------------------------------------------------------- #
+    plt.yscale("log")
+    plt.xlabel("No. Iterations")
+    plt.ylabel("Function Value")
+    plt.title(f"Minibatch SGD Constant ($\\alpha={alpha0:.1e}$) vs Polyak Step Size with $\\sigma={sigma}$, {runs} runs each)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("images//lr_batch.svg")
+    plt.show()
+    plt.close()
 
+    p_batch_size = 2
+    sigma = 0.05
+    alpha0 = 0.1
+    epochs = max_iters*p_batch_size//data_size
+
+    X = (2*torch.rand(data_size)-1).view(-1, 1)
+    Y = 5*X + 2 + sigma*torch.randn(data_size).view(-1, 1)
+    dataset = torch.utils.data.TensorDataset(X, Y)
+    batchloader = torch.utils.data.DataLoader(dataset, batch_size=p_batch_size, shuffle=True)
+
+    polyak_loss = np.zeros((runs, max_iters))
+    polyak_params = np.zeros((runs, max_iters))
+    for run in range(runs):
+        losses = np.zeros(max_iters)
+        model = LinearRegressionModel()
+        optim = PolyakSGD(model.parameters(), mean_reduce=True, batch_size=p_batch_size)
+        for i in range(epochs):
+            for j, (x, y) in enumerate(batchloader):
+                def closure():
+                    optim.zero_grad()
+                    loss = F.mse_loss(model(x), y)
+                    loss.backward()
+                    return loss
+                loss, alpha = optim.step(closure)
+                losses[(data_size//p_batch_size)*i + j] = float(loss)
+        polyak_loss[run] = losses
+
+    c_batch_size = 25
+    epochs = max_iters*c_batch_size//data_size 
+    batchloader = torch.utils.data.DataLoader(dataset, batch_size=c_batch_size, shuffle=True)
+    const_loss = np.zeros((runs, max_iters))
+    for run in range(runs):
+        losses = np.zeros(max_iters)
+        model = LinearRegressionModel()
+        optim = torch.optim.SGD(model.parameters(), lr=alpha0)
+        for i in range(epochs):
+            for j, (x, y) in enumerate(batchloader):
+                optim.zero_grad()
+                loss = F.mse_loss(model(x), y)
+                loss.backward()
+                optim.step()
+                losses[(data_size//c_batch_size)*i + j] = float(loss)
+        const_loss[run] = losses
+
+    plt.figure(figsize=(12, 6))
+    plt.errorbar(iters, const_loss.mean(axis=0), const_loss.std(axis=0), label=f"Constant $\\alpha = {alpha0}$")
+    plt.errorbar(iters, polyak_loss.mean(axis=0), polyak_loss.std(axis=0), label=f"Polyak")
+    plt.yscale("log")
+    plt.xlabel("No. Iterations")
+    plt.ylabel("Function Value")
+    plt.title(f"Minibatch SGD Constant ($\\alpha={alpha0:.1e}, N={c_batch_size}$) vs Polyak Step Size ($N={p_batch_size}$), with $\\sigma={sigma}$, {runs} runs each)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("images//lr_const_polyak_comp.svg")
+    plt.show()
+    plt.close()
+    # ----------------------------------------------------------------------- #
+
+    # ----------------------------------------------------------------------- #
+    # q1 (c)
+    # ----------------------------------------------------------------------- #
+    lossfunc = Week6LossFunction()
+    data_size = 100
+    batch_size = 25
+    max_iters = 100
+    runs = 10
+
+    data = lossfunc.generate_trainingdata(data_size)
+    epochs = max_iters*batch_size//data_size 
+    alpha0 = 2e-3
+    x0 = [3.0, 3.0]
+    
+    const_loss = np.zeros((runs, max_iters))
+    for run in range(runs):
+        losses = np.zeros(max_iters)
+        X = nn.Parameter(torch.tensor(x0), requires_grad=True)
+        optimizer = torch.optim.SGD([X], lr=alpha0)
+        for i in range(epochs):
+            indices = torch.randperm(data_size)
+            itr = 0
+            for j in range(0,data_size, batch_size):
+                batch = data[indices[j: j+batch_size]]
+                optimizer.zero_grad()
+                loss = lossfunc.f(X, batch)
+                loss.backward()
+                optimizer.step()
+                losses[(data_size//batch_size)*i + itr] = float(loss)
+                itr += 1
+        const_loss[run] = losses
+
+    polyak_loss = np.zeros((runs, max_iters))
+    for run in range(runs):
+        losses = np.zeros(max_iters)
+        X = nn.Parameter(torch.tensor(x0), requires_grad=True)
+        optimizer = PolyakSGD([X])
+        for i in range(epochs):
+            indices = torch.randperm(data_size)
+            itr = 0
+            for j in range(0,data_size, batch_size):
+                batch = data[indices[j: j+batch_size]]
+                def closure():
+                    optimizer.zero_grad()
+                    loss = lossfunc.f(X, batch)
+                    loss.backward()
+                    return loss
+                loss, alpha = optimizer.step(closure)
+                losses[(data_size//batch_size)*i + itr] = float(loss)
+                itr += 1
+        polyak_loss[run] = losses
+
+    iters = [i+1 for i in range(max_iters)]
+    plt.figure(figsize=(12, 6))
+    plt.errorbar(iters, const_loss.mean(axis=0), const_loss.std(axis=0), label=f"Constant $\\alpha = {alpha0}$")
+    plt.errorbar(iters, polyak_loss.mean(axis=0), polyak_loss.std(axis=0), label=f"Polyak")
+    plt.yscale("log")
+    plt.xlabel("No. Iterations")
+    plt.ylabel("Function Value")
+    plt.title(f"Minibatch SGD Constant ($\\alpha={alpha0:.1e}$) vs Polyak Step Size with $N={batch_size}$, {runs} runs each)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(f"images//week6_func_same_batch.svg")
+    plt.show()
+    plt.close()
+
+    c_batch_size = 25
+    data = lossfunc.generate_trainingdata(data_size)
+    epochs = max_iters*c_batch_size//data_size 
+    alpha0 = 0.05
+    x0 = [3.0, 3.0]
+    
+    const_loss = np.zeros((runs, max_iters))
+    const_params = np.zeros((runs, max_iters, 2))
+    for run in range(runs):
+        losses = np.zeros(max_iters)
+        params = np.zeros((max_iters, 2))
+        X = nn.Parameter(torch.tensor(x0), requires_grad=True)
+        optimizer = torch.optim.SGD([X], lr=alpha0)
+        for i in range(epochs):
+            indices = torch.randperm(data_size)
+            itr = 0
+            for j in range(0,data_size, c_batch_size):
+                batch = data[indices[j: j+c_batch_size]]
+                optimizer.zero_grad()
+                loss = lossfunc.f(X, batch)
+                loss.backward()
+                optimizer.step()
+                losses[(data_size//c_batch_size)*i + itr] = float(loss)
+                params[(data_size//c_batch_size)*i + itr] = np.array(X.tolist())
+                itr += 1
+        const_loss[run] = losses
+        const_params[run] = params
+
+    p_batch_size = 4
+    data = lossfunc.generate_trainingdata(data_size)
+    epochs = max_iters*p_batch_size//data_size 
+    x0 = [3.0, 3.0]
+
+    polyak_loss = np.zeros((runs, max_iters))
+    polyak_alphas = np.zeros((runs, max_iters))
+    polyak_params = np.zeros((runs, max_iters, 2))
+    for run in range(runs):
+        losses = np.zeros(max_iters)
+        alphas = np.zeros(max_iters)
+        params = np.zeros((max_iters, 2))
+        X = nn.Parameter(torch.tensor(x0), requires_grad=True)
+        optimizer = PolyakSGD([X])
+        for i in range(epochs):
+            indices = torch.randperm(data_size)
+            itr = 0
+            for j in range(0,data_size, p_batch_size):
+                batch = data[indices[j: j+p_batch_size]]
+                def closure():
+                    optimizer.zero_grad()
+                    loss = lossfunc.f(X, batch)
+                    loss.backward()
+                    return loss
+                loss, alpha = optimizer.step(closure)
+                losses[(data_size//p_batch_size)*i + itr] = float(loss)
+                params[(data_size//p_batch_size)*i + itr] = np.array(X.tolist())
+                alphas[(data_size//p_batch_size)*i + itr] = alpha
+                itr += 1
+        polyak_loss[run] = losses
+        polyak_params[run] = params
+        polyak_alphas[run] = alphas
+
+    iters = [i+1 for i in range(max_iters)]
+    plt.figure(figsize=(12, 6))
+    plt.errorbar(iters, const_loss.mean(axis=0), const_loss.std(axis=0), label=f"Constant $\\alpha = {alpha0}, N={c_batch_size}$")
+    plt.errorbar(iters, polyak_loss.mean(axis=0), polyak_loss.std(axis=0), label=f"Polyak $N = {p_batch_size}$")
+    plt.yscale("log")
+    plt.xlabel("No. Iterations")
+    plt.ylabel("Function Value")
+    plt.title(f"Minibatch SGD Constant ($\\alpha={alpha0:.1e}, N={c_batch_size}$) vs Polyak Step Size ($N={p_batch_size}$), {runs} runs each)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(f"images//week6_func_different_batch.svg")
+    plt.show()
+    plt.close()
+    
     # ----------------------------------------------------------------------- #
     # q1 (d)
     # ----------------------------------------------------------------------- #
-    train_path = "input_childSpeech_trainingSet.txt"
-    with open(train_path) as f:
-        train_text = f.read()
-    chars = sorted(list(set(train_text)))
-    stoi = { ch:i for i,ch in enumerate(chars) }
-    encode = lambda s: [stoi[c] for c in s]
-    train_data = torch.tensor(encode(train_text), dtype=torch.long)
-    split = int(0.9*len(train_data))
-    train_data, val_data = train_data[:split], train_data[split:]
+    # train_path = "input_childSpeech_trainingSet.txt"
+    # with open(train_path) as f:
+    #     train_text = f.read()
+    # chars = sorted(list(set(train_text)))
+    # stoi = { ch:i for i,ch in enumerate(chars) }
+    # encode = lambda s: [stoi[c] for c in s]
+    # train_data = torch.tensor(encode(train_text), dtype=torch.long)
+    # split = int(0.9*len(train_data))
+    # train_data, val_data = train_data[:split], train_data[split:]
     
-    test_path = "input_childSpeech_testSet.txt"
-    with open(test_path) as f:
-        test_text = f.read()
-    test_data = torch.tensor(encode(test_text), dtype=torch.long)
+    # test_path = "input_childSpeech_testSet.txt"
+    # with open(test_path) as f:
+    #     test_text = f.read()
+    # test_data = torch.tensor(encode(test_text), dtype=torch.long)
 
-    model = GPTLanguageModel(len(chars), n_embd, n_head, n_layer).to(device)
-    print("-"*80,f'Initial Model: {sum(p.numel() for p in model.parameters())/1e6:0.4f}M parameters', sep="\n")
-    train_transformer_polyak(model, train_data, val_data)
-    mean_model_loss, std_model_loss = estimate_test_loss(model, test_data)
-    print(f"Polyak test loss: Mean {mean_model_loss:0.4f}, Standard Deviation: {std_model_loss:0.4f}")
+    # model = GPTLanguageModel(len(chars), n_embd, n_head, n_layer).to(device)
+    # print("-"*80,f'Initial Model: {sum(p.numel() for p in model.parameters())/1e6:0.4f}M parameters', sep="\n")
+    # train_transformer_polyak(model, train_data, val_data)
+    # mean_model_loss, std_model_loss = estimate_test_loss(model, test_data)
+    # print(f"Polyak test loss: Mean {mean_model_loss:0.4f}, Standard Deviation: {std_model_loss:0.4f}")
 
-    model = GPTLanguageModel(len(chars), n_embd, n_head, n_layer).to(device)
-    print("-"*80,f'Initial Model: {sum(p.numel() for p in model.parameters())/1e6:0.4f}M parameters', sep="\n")
-    train_transformer_const(model, train_data, val_data)
-    mean_model_loss, std_model_loss = estimate_test_loss(model, test_data)
-    print(f"Constant test loss: Mean {mean_model_loss:0.4f}, Standard Deviation: {std_model_loss:0.4f}")
+    # model = GPTLanguageModel(len(chars), n_embd, n_head, n_layer).to(device)
+    # print("-"*80,f'Initial Model: {sum(p.numel() for p in model.parameters())/1e6:0.4f}M parameters', sep="\n")
+    # train_transformer_const(model, train_data, val_data)
+    # mean_model_loss, std_model_loss = estimate_test_loss(model, test_data)
+    # print(f"Constant test loss: Mean {mean_model_loss:0.4f}, Standard Deviation: {std_model_loss:0.4f}")
 
-    model = GPTLanguageModel(len(chars), n_embd, n_head, n_layer).to(device)
-    print("-"*80,f'Initial Model: {sum(p.numel() for p in model.parameters())/1e6:0.4f}M parameters', sep="\n")
-    train_transformer_adam(model, train_data, val_data)
-    mean_model_loss, std_model_loss = estimate_test_loss(model, test_data)
-    print(f"Adam test loss: Mean {mean_model_loss:0.4f}, Standard Deviation: {std_model_loss:0.4f}")
+    # model = GPTLanguageModel(len(chars), n_embd, n_head, n_layer).to(device)
+    # print("-"*80,f'Initial Model: {sum(p.numel() for p in model.parameters())/1e6:0.4f}M parameters', sep="\n")
+    # train_transformer_adam(model, train_data, val_data)
+    # mean_model_loss, std_model_loss = estimate_test_loss(model, test_data)
+    # print(f"Adam test loss: Mean {mean_model_loss:0.4f}, Standard Deviation: {std_model_loss:0.4f}")
+
+    # ----------------------------------------------------------------------- #
+    # q1 (e)
+    # ----------------------------------------------------------------------- #
+    runs = 20
+    max_iters = 100
+    data_size = 100
+    batch_size = 25
+    alpha0 = 1e-2
+
+    epochs = max_iters*batch_size//data_size    
+    iters = [i+1 for i in range(max_iters)]
+    plt.figure(figsize=(12, 6))
+
+    for sigma in [0.5, 0.1, 0.05, 0.01]:
+        X = (2*torch.rand(data_size)-1).view(-1, 1)
+        Y = 5*X + 2 + sigma*torch.randn(data_size).view(-1, 1)
+
+        dataset = torch.utils.data.TensorDataset(X, Y)
+        batchloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+        polyak_loss = np.zeros((runs, max_iters))
+        for run in range(runs):
+            losses = np.zeros(max_iters)
+            model = LinearRegressionModel()
+            optim = PolyakAdam(model.parameters())
+            for i in range(epochs):
+                for j, (x, y) in enumerate(batchloader):
+                    def closure():
+                        optim.zero_grad()
+                        loss = F.mse_loss(model(x), y, reduction="sum")
+                        loss.backward()
+                        return loss
+                    loss, alpha = optim.step(closure)
+                    losses[(data_size//batch_size)*i + j] = float(loss)
+            polyak_loss[run] = losses
+
+        const_loss = np.zeros((runs, max_iters))
+        for run in range(runs):
+            losses = np.zeros(max_iters)
+            model = LinearRegressionModel()
+            optim = torch.optim.SGD(model.parameters(), lr=alpha0)
+            for i in range(epochs):
+                for j, (x, y) in enumerate(batchloader):
+                    optim.zero_grad()
+                    loss = F.mse_loss(model(x), y, reduction="sum")
+                    loss.backward()
+                    optim.step()
+                    losses[(data_size//batch_size)*i + j] = float(loss)
+            const_loss[run] = losses
+
+        plt.errorbar(iters, const_loss.mean(axis=0), const_loss.std(axis=0), linestyle="dashed", label=f"Constant $\\sigma = {sigma}$")
+        plt.errorbar(iters, polyak_loss.mean(axis=0), polyak_loss.std(axis=0), label=f"Polyak $\\sigma = {sigma}$")
+
+    plt.yscale("log")
+    plt.xlabel("No. Iterations")
+    plt.ylabel("Function Value")
+    plt.title(f"Minibatch SGD Constant ($\\alpha={alpha0:.1e}$) vs Adam Polyak Step Size with $N={batch_size}$, {runs} runs each)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("images//adam_lr_noise.svg")
+    plt.show()
+    plt.close()
+
+    plt.figure(figsize=(12, 6))
+    for batch_size in [2, 10, 20, 50]:
+        sigma = 0.05
+        epochs = max_iters*batch_size//data_size   
+        X = (2*torch.rand(data_size)-1).view(-1, 1)
+        Y = 5*X + 2 + sigma*torch.randn(data_size).view(-1, 1)
+
+        dataset = torch.utils.data.TensorDataset(X, Y)
+        batchloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+        polyak_loss = np.zeros((runs, max_iters))
+        polyak_params = np.zeros((runs, max_iters))
+        for run in range(runs):
+            losses = np.zeros(max_iters)
+            model = LinearRegressionModel()
+            optim = PolyakAdam(model.parameters())
+            for i in range(epochs):
+                for j, (x, y) in enumerate(batchloader):
+                    def closure():
+                        optim.zero_grad()
+                        loss = F.mse_loss(model(x), y, reduction="sum")
+                        loss.backward()
+                        return loss
+                    loss, alpha = optim.step(closure)
+                    losses[(data_size//batch_size)*i + j] = float(loss)
+            polyak_loss[run] = losses
+
+        const_loss = np.zeros((runs, max_iters))
+        for run in range(runs):
+            losses = np.zeros(max_iters)
+            model = LinearRegressionModel()
+            optim = torch.optim.SGD(model.parameters(), lr=alpha0)
+            for i in range(epochs):
+                for j, (x, y) in enumerate(batchloader):
+                    optim.zero_grad()
+                    loss = F.mse_loss(model(x), y, reduction="sum")
+                    loss.backward()
+                    optim.step()
+                    losses[(data_size//batch_size)*i + j] = float(loss)
+            const_loss[run] = losses
+
+        plt.errorbar(iters, const_loss.mean(axis=0), const_loss.std(axis=0), linestyle="dashed", label=f"Constant $N = {batch_size}$")
+        plt.errorbar(iters, polyak_loss.mean(axis=0), polyak_loss.std(axis=0), label=f"Polyak $N = {batch_size}$")
+
+    plt.yscale("log")
+    plt.xlabel("No. Iterations")
+    plt.ylabel("Function Value")
+    plt.title(f"Minibatch SGD Constant ($\\alpha={alpha0:.1e}$) vs Adam Polyak Step Size with $\\sigma={sigma}$, {runs} runs each)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("images//adam_lr_batch.svg")
+    plt.show()
+    plt.close()
+    # ----------------------------------------------------------------------- #
